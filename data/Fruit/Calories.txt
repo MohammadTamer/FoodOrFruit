@@ -1,0 +1,59 @@
+Pomegranate: ~0.83 calories per gram
+
+Watermelon: ~0.30 calories per gram
+
+White Pear: ~0.57 calories per gram
+
+Palm: ~2.8 calories per gram
+
+Persimmon: ~0.81 calories per gram
+
+Pineapple: ~0.50 calories per gram
+
+Olive: ~1.15 calories per gram
+
+Orange: ~0.47 calories per gram
+
+Mango_Amrapali: ~0.65 calories per gram
+
+Mango_Bari: ~0.65 calories per gram
+
+Mango_Himsagar: ~0.65 calories per gram
+
+Lichi: ~0.66 calories per gram
+
+Malta: ~0.47 calories per gram
+
+Mango Golden Queen: ~0.65 calories per gram
+
+Mango_Alphonso: ~0.65 calories per gram
+
+Hog Plum: ~0.50 calories per gram
+
+Kiwi: ~0.61 calories per gram
+
+Green Coconut: ~1.90 calories per gram
+
+Guava: ~0.68 calories per gram
+
+Elephant Apple: ~0.60 calories per gram
+
+Grape: ~0.69 calories per gram
+
+Date Palm: ~2.8 calories per gram
+
+Dragon: ~0.60 calories per gram
+
+Carambola: ~0.31 calories per gram
+
+Berry: ~0.50 calories per gram
+
+Burmese Grape: ~0.55 calories per gram
+
+Avocado: ~1.60 calories per gram
+
+Banana: ~0.89 calories per gram
+
+Apple_Gala: ~0.52 calories per gram
+
+Apple_Golden Delicious: ~0.52 calories per gram
