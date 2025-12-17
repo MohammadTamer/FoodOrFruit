@@ -1,3 +1,4 @@
+import glob
 import os
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ CONFIG = {
 }
 
 
-# -------------------- Utilities --------------------
+#  Utilities
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -62,8 +63,7 @@ def create_output_directories():
     os.makedirs(os.path.join(CONFIG['output_dir'], 'predictions'), exist_ok=True)
 
 
-# Simple logger that writes to file and prints concise messages to console depending on level
-def log_message(message, level = 'INFO'):
+def log_message(message, level='INFO'):
     levels = {'DEBUG': 10, 'INFO': 20, 'ERROR': 40}
     configured = levels.get(CONFIG.get('log_level', 'INFO'), 20)
     msg_level = levels.get(level, 20)
@@ -79,7 +79,18 @@ def log_message(message, level = 'INFO'):
         print(full)
 
 
-# -------------------- Data helpers --------------------
+def save_predictions_to_file(predictions, output_file):
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("Image Name | TopCategory | TopConf | Subclass | SubConf")
+        f.write("=" * 120 + "")
+        for pred in predictions:
+            image_name = os.path.basename(pred['image_path'])
+            subcls = pred.get('subclass', '')
+            subconf = pred.get('sub_conf', 0.0)
+            f.write(f"{image_name} | {pred['prediction']} | {pred['confidence']:.4f} | {subcls} | {subconf:.4f}")
+
+
+# Data Preparation
 
 def get_all_image_paths(data_root):
     image_paths = {'Food': [], 'Fruit': []}
@@ -119,7 +130,7 @@ def get_all_image_paths(data_root):
     return image_paths
 
 
-def split_dataset(image_paths, validation_split = 0.2):
+def split_dataset(image_paths, validation_split=0.2):
     train_paths = {'Food': [], 'Fruit': []}
     val_paths = {'Food': [], 'Fruit': []}
 
@@ -165,9 +176,9 @@ class ImageDataset(Dataset):
         return img_tensor, torch.tensor(label, dtype=torch.long)
 
 
-# -------------------- Models --------------------
+# COMPLETE MODEL – Binary Classification
 
-def create_complete_model(num_classes = 2):
+def create_complete_model(num_classes=2):
     resnet = models.resnet50()
     embedding_net = nn.Sequential(*list(resnet.children())[:-1])
 
@@ -189,65 +200,6 @@ def create_complete_model(num_classes = 2):
 
     return full_model
 
-
-def create_fruit_model(num_classes):
-    resnet = models.resnet50()
-    embedding_net = nn.Sequential(*list(resnet.children())[:-1])
-    classifier_head = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(2048, 512),
-        nn.ReLU(),
-        nn.Dropout(0.5),
-        nn.Linear(512, num_classes)
-    )
-    full_model = nn.Sequential(
-        embedding_net,
-        classifier_head
-    )
-    return full_model
-
-
-def create_siamese_embedding(out_dim = 512):
-    """
-    Return a lightweight convolutional embedding model implemented with nn.Sequential.
-    The returned model outputs raw embeddings (not L2-normalized). Normalization
-    should be applied where the model is called (e.g. in train_siamese), exactly like
-    the existing code does: e = F.normalize(e, p=2, dim=1)
-    """
-
-    backbone = nn.Sequential(
-        nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),   # 224 -> 112
-        nn.BatchNorm2d(32),
-        nn.ReLU(inplace=True),
-
-        nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 112 -> 56
-        nn.BatchNorm2d(64),
-        nn.ReLU(inplace=True),
-
-        nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 56 -> 28
-        nn.BatchNorm2d(128),
-        nn.ReLU(inplace=True),
-
-        nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),# 28 -> 14
-        nn.BatchNorm2d(256),
-        nn.ReLU(inplace=True),
-
-        nn.AdaptiveAvgPool2d((1, 1))  # -> (B, 256, 1, 1)
-    )
-
-    head = nn.Sequential(
-        nn.Flatten(),           # -> (B, 256)
-        nn.Linear(256, 1024),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.4),
-        nn.Linear(1024, out_dim)  # -> (B, out_dim)
-    )
-
-    model = nn.Sequential(backbone, head)
-    return model
-
-
-# -------------------- Training / Eval helpers --------------------
 
 def train_epoch(model, train_loader, optimizer, loss_calc_method, device):
     model.train()
@@ -378,7 +330,69 @@ def evaluate_on_validation(model, val_loader, device):
     return metrics
 
 
-# -------------------- Fruit classifier (extracted) --------------------
+def predict_single_image(model, image_path, transform, device):
+    image = load_image(image_path)
+    if image is None:
+        return None
+    image_tensor = transform(image).unsqueeze(0).to(device)
+    model.eval()
+    with torch.no_grad():
+        model_output = model(image_tensor)
+        probs = torch.softmax(model_output, dim=1)
+        confidence, predicted = torch.max(probs, 1)
+    categories = ['Food', 'Fruit']
+    return {'category': categories[predicted.item()], 'confidence': float(confidence.item())}
+
+
+# FRUIT MODEL – Multi-class Classification
+def build_class_to_paths_for_fruit(data_root: str):
+    fruit_root = os.path.join(data_root, 'Fruit')
+    class_to_paths = {}
+    if not os.path.exists(fruit_root):
+        return {}, []
+    for split in os.listdir(fruit_root):
+        split_path = os.path.join(fruit_root, split)
+        if not os.path.isdir(split_path):
+            continue
+        for cls in os.listdir(split_path):
+            cls_path = os.path.join(split_path, cls)
+            if not os.path.isdir(cls_path):
+                continue
+            images_dir = os.path.join(cls_path, 'Images')
+            if not os.path.exists(images_dir):
+                continue
+            imgs = []
+            for f0 in os.listdir(images_dir):
+                if f0.lower().endswith(('.jpg', '.png', '.jpeg')):
+                    imgs.append(os.path.join(images_dir, f0))
+            if len(imgs) == 0:
+                continue
+            if cls not in class_to_paths:
+                class_to_paths[cls] = imgs
+            else:
+                class_to_paths[cls].extend(imgs)
+    class_names = sorted(list(class_to_paths.keys()))
+    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    mapped = {name_to_idx[name]: class_to_paths[name] for name in class_names}
+    return mapped, class_names
+
+
+def create_fruit_model(num_classes):
+    resnet = models.resnet50()
+    embedding_net = nn.Sequential(*list(resnet.children())[:-1])
+    classifier_head = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(2048, 512),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(512, num_classes)
+    )
+    full_model = nn.Sequential(
+        embedding_net,
+        classifier_head
+    )
+    return full_model
+
 
 def train_fruit_classifier(fruit_map, fruit_class_names, train_transform, val_transform, device):
     if len(fruit_map) == 0 or len(fruit_class_names) == 0:
@@ -464,7 +478,59 @@ def train_fruit_classifier(fruit_map, fruit_class_names, train_transform, val_tr
     return fruit_model
 
 
-# -------------------- Siamese training (extracted) --------------------
+def predict_fruit(model, image_path, transform, device, class_names):
+    image = load_image(image_path)
+    if image is None:
+        return {'class': None, 'confidence': 0.0}
+    tensor = transform(image).unsqueeze(0).to(device)
+    model.eval()
+    with torch.no_grad():
+        out = model(tensor)
+        probs = torch.softmax(out, dim=1)
+        conf, idx = torch.max(probs, dim=1)
+    return {'class': class_names[idx.item()], 'confidence': float(conf.item())}
+
+
+# FOOD MODEL – Siamese / Few-Shot
+def create_siamese_embedding(out_dim=512):
+    """
+    Return a lightweight convolutional embedding model implemented with nn.Sequential.
+    The returned model outputs raw embeddings (not L2-normalized). Normalization
+    should be applied where the model is called (e.g. in train_siamese), exactly like
+    the existing code does: e = F.normalize(e, p=2, dim=1)
+    """
+
+    backbone = nn.Sequential(
+        nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),  # 224 -> 112
+        nn.BatchNorm2d(32),
+        nn.ReLU(inplace=True),
+
+        nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 112 -> 56
+        nn.BatchNorm2d(64),
+        nn.ReLU(inplace=True),
+
+        nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 56 -> 28
+        nn.BatchNorm2d(128),
+        nn.ReLU(inplace=True),
+
+        nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # 28 -> 14
+        nn.BatchNorm2d(256),
+        nn.ReLU(inplace=True),
+
+        nn.AdaptiveAvgPool2d((1, 1))  # -> (B, 256, 1, 1)
+    )
+
+    head = nn.Sequential(
+        nn.Flatten(),  # -> (B, 256)
+        nn.Linear(256, 1024),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.4),
+        nn.Linear(1024, out_dim)  # -> (B, out_dim)
+    )
+
+    model = nn.Sequential(backbone, head)
+    return model
+
 
 def train_siamese(embedding_model, class_to_paths, device,
                   epochs=3, batch_size=16, lr=1e-4, margin=0.5, pairs_per_class=200, transform=None):
@@ -530,6 +596,20 @@ def train_siamese(embedding_model, class_to_paths, device,
     return embedding_model
 
 
+def train_siamese_embedding_for_food(food_map, train_transform, val_transform, device):
+    log_message("Training Siamese embedding for Food...", 'INFO')
+    siamese_model = create_siamese_embedding(out_dim=512)
+    siamese_model = train_siamese(siamese_model, food_map, device,
+                                  epochs=CONFIG.get('siamese_epochs', 3),
+                                  batch_size=CONFIG.get('siamese_batch', 16),
+                                  lr=CONFIG.get('siamese_lr', 1e-4),
+                                  margin=CONFIG.get('siamese_margin', 0.5),
+                                  pairs_per_class=CONFIG.get('siamese_pairs_per_class', 200),
+                                  transform=train_transform)
+    support_mean = build_support_embeddings(siamese_model, food_map, device, val_transform, max_images_per_class=50)
+    return siamese_model, support_mean
+
+
 def build_support_embeddings(embedding_model, class_to_paths, device, transform, max_images_per_class=50):
     embedding_model.to(device)
     embedding_model.eval()
@@ -557,49 +637,6 @@ def build_support_embeddings(embedding_model, class_to_paths, device, transform,
     return support_mean
 
 
-def train_siamese_embedding_for_food(food_map, train_transform, val_transform, device):
-    log_message("Training Siamese embedding for Food...", 'INFO')
-    siamese_model = create_siamese_embedding(out_dim=512)
-    siamese_model = train_siamese(siamese_model, food_map, device,
-                                  epochs=CONFIG.get('siamese_epochs', 3),
-                                  batch_size=CONFIG.get('siamese_batch', 16),
-                                  lr=CONFIG.get('siamese_lr', 1e-4),
-                                  margin=CONFIG.get('siamese_margin', 0.5),
-                                  pairs_per_class=CONFIG.get('siamese_pairs_per_class', 200),
-                                  transform=train_transform)
-    support_mean = build_support_embeddings(siamese_model, food_map, device, val_transform, max_images_per_class=50)
-    return siamese_model, support_mean
-
-
-# -------------------- Prediction helpers --------------------
-
-def predict_single_image(model, image_path, transform, device):
-    image = load_image(image_path)
-    if image is None:
-        return None
-    image_tensor = transform(image).unsqueeze(0).to(device)
-    model.eval()
-    with torch.no_grad():
-        model_output = model(image_tensor)
-        probs = torch.softmax(model_output, dim=1)
-        confidence, predicted = torch.max(probs, 1)
-    categories = ['Food', 'Fruit']
-    return {'category': categories[predicted.item()], 'confidence': float(confidence.item())}
-
-
-def predict_fruit(model, image_path, transform, device, class_names):
-    image = load_image(image_path)
-    if image is None:
-        return {'class': None, 'confidence': 0.0}
-    tensor = transform(image).unsqueeze(0).to(device)
-    model.eval()
-    with torch.no_grad():
-        out = model(tensor)
-        probs = torch.softmax(out, dim=1)
-        conf, idx = torch.max(probs, dim=1)
-    return {'class': class_names[idx.item()], 'confidence': float(conf.item())}
-
-
 def few_shot_predict(embedding_model, image_path, transform, device, support_mean, class_names, threshold=0.6):
     image = load_image(image_path)
     if image is None:
@@ -622,21 +659,6 @@ def few_shot_predict(embedding_model, image_path, transform, device, support_mea
         return {'class': 'no_match', 'confidence': best_sim}
     return {'class': class_names[best_cls], 'confidence': best_sim}
 
-
-# -------------------- Helpers to save outputs --------------------
-
-def save_predictions_to_file(predictions, output_file):
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("Image Name | TopCategory | TopConf | Subclass | SubConf")
-        f.write("=" * 120 + "")
-        for pred in predictions:
-            image_name = os.path.basename(pred['image_path'])
-            subcls = pred.get('subclass', '')
-            subconf = pred.get('sub_conf', 0.0)
-            f.write(f"{image_name} | {pred['prediction']} | {pred['confidence']:.4f} | {subcls} | {subconf:.4f}")
-
-
-# -------------------- Class map builders --------------------
 
 def build_class_to_paths_for_food(data_root: str):
     food_root = os.path.join(data_root, 'Food')
@@ -666,40 +688,263 @@ def build_class_to_paths_for_food(data_root: str):
     mapped = {name_to_idx[name]: class_to_paths[name] for name in class_names}
     return mapped, class_names
 
+# Segmentation
 
-def build_class_to_paths_for_fruit(data_root: str):
-    fruit_root = os.path.join(data_root, 'Fruit')
-    class_to_paths = {}
-    if not os.path.exists(fruit_root):
-        return {}, []
-    for split in os.listdir(fruit_root):
-        split_path = os.path.join(fruit_root, split)
-        if not os.path.isdir(split_path):
+class FruitSegmentationDataset(Dataset):
+    """
+    Works for:
+    - Binary segmentation (mask: 0 background, 255 fruit)
+    - Multi-class segmentation (mask: 0 background, 1..30 fruit classes)
+    """
+
+    def __init__(self, image_paths, mask_paths, transform_img=None, transform_mask=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform_img = transform_img
+        self.transform_mask = transform_mask
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        mask = Image.open(self.mask_paths[idx])
+
+        if self.transform_img:
+            img = self.transform_img(img)
+
+        if self.transform_mask:
+            mask = self.transform_mask(mask)
+        else:
+            mask = torch.from_numpy(np.array(mask)).long()
+
+        return img, mask
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1):
+        super().__init__()
+        self.d1 = DoubleConv(in_channels, 64)
+        self.d2 = DoubleConv(64, 128)
+        self.d3 = DoubleConv(128, 256)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.bridge = DoubleConv(256, 512)
+
+        self.u3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.c3 = DoubleConv(512, 256)
+
+        self.u2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.c2 = DoubleConv(256, 128)
+
+        self.u1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.c1 = DoubleConv(128, 64)
+
+        self.out = nn.Conv2d(64, num_classes, 1)
+
+    def forward(self, x):
+        d1 = self.d1(x)
+        d2 = self.d2(self.pool(d1))
+        d3 = self.d3(self.pool(d2))
+
+        b = self.bridge(self.pool(d3))
+
+        x = self.u3(b)
+        x = self.c3(torch.cat([x, d3], dim=1))
+        x = self.u2(x)
+        x = self.c2(torch.cat([x, d2], dim=1))
+        x = self.u1(x)
+        x = self.c1(torch.cat([x, d1], dim=1))
+
+        return self.out(x)
+
+
+def train_binary_segmentation(image_paths, mask_paths, device):
+    log_message("Training Fruit Binary Segmentation (Part D)...", "INFO")
+
+    model = UNet(num_classes=1).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
+
+    img_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    mask_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    ds = FruitSegmentationDataset(image_paths, mask_paths, img_tf, mask_tf)
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+
+    for epoch in range(3):
+        model.train()
+        loss_sum = 0
+        for imgs, masks in loader:
+            imgs = imgs.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss = criterion(preds, masks)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item()
+
+        log_message(f"[Binary Seg] Epoch {epoch + 1}/3 | Loss: {loss_sum / len(loader):.4f}", "INFO")
+
+    torch.save(model.state_dict(), "stage1_output/binary_segmentation.pth")
+    log_message("Binary segmentation model saved.", "INFO")
+    return model
+
+
+def train_multiclass_segmentation(image_paths, mask_paths, num_classes, device):
+    log_message("Training Fruit Multi-Class Segmentation (Part E)...", "INFO")
+
+    model = UNet(num_classes=num_classes).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    img_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    # Updated mask transform
+    def mask_transform(x):
+        mask_np = np.array(x).astype(np.int64)  # ensure int64
+        # Map unique mask IDs to 0..num_classes-1
+        unique_ids = sorted(np.unique(mask_np))
+        id_map = {old_id: new_id for new_id, old_id in enumerate(unique_ids)}
+        mask_mapped = np.vectorize(id_map.get)(mask_np)
+        mask_mapped = np.clip(mask_mapped, 0, num_classes - 1)  # safety clip
+        return torch.from_numpy(mask_mapped).long()
+
+    mask_tf = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=Image.NEAREST),
+        transforms.Lambda(mask_transform)
+    ])
+
+    ds = FruitSegmentationDataset(image_paths, mask_paths, img_tf, mask_tf)
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+
+    for epoch in range(3):
+        model.train()
+        loss_sum = 0
+        for imgs, masks in loader:
+            imgs = imgs.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss = criterion(preds, masks)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item()
+
+        log_message(f"[Multi Seg] Epoch {epoch + 1}/3 | Loss: {loss_sum / len(loader):.4f}", "INFO")
+
+    torch.save(model.state_dict(), "stage1_output/multiclass_segmentation.pth")
+    log_message("Multi-class segmentation model saved.", "INFO")
+    return model
+
+
+def save_segmentation_output(model, image_path, save_path, device, multiclass=False):
+    model.eval()
+    img = Image.open(image_path).convert("RGB")
+    tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+    x = tf(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(x)
+
+    if multiclass:
+        mask = torch.argmax(out, dim=1).squeeze(0).cpu().numpy()
+    else:
+        mask = (torch.sigmoid(out) > 0.5).squeeze().cpu().numpy() * 255
+
+    Image.fromarray(mask.astype(np.uint8)).save(save_path)
+
+
+def collect_fruit_segmentation_data(data_root):
+    """
+    Collect images and masks for fruit segmentation.
+    Matches images in <Class>/Images with masks in <Class>/Mask.
+    Filenames must match ignoring extension and '_mask' suffix.
+    """
+    images = []
+    masks = []
+
+    seg_root = os.path.join(data_root, 'Fruit', 'Validation')
+    log_message(f"[DEBUG] Looking for classes in: {seg_root}", 'INFO')
+
+    if not os.path.exists(seg_root):
+        log_message(f"[ERROR] Segmentation root folder not found: {seg_root}", 'ERROR')
+        return images, masks
+
+    class_folders = [f for f in os.listdir(seg_root) if os.path.isdir(os.path.join(seg_root, f))]
+    log_message(f"[DEBUG] Found class folders: {class_folders}", 'INFO')
+
+    for cls in class_folders:
+        img_dir = os.path.join(seg_root, cls, 'Images')
+        mask_dir = os.path.join(seg_root, cls, 'Mask')
+
+        log_message(f"[DEBUG] Processing class: {cls}", 'INFO')
+        log_message(f"[DEBUG] Images dir: {img_dir}", 'INFO')
+        log_message(f"[DEBUG] Mask dir: {mask_dir}", 'INFO')
+
+        if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
+            log_message(f"[WARNING] Missing Images or Mask folder for class {cls}, skipping.", 'WARNING')
             continue
-        for cls in os.listdir(split_path):
-            cls_path = os.path.join(split_path, cls)
-            if not os.path.isdir(cls_path):
-                continue
-            images_dir = os.path.join(cls_path, 'Images')
-            if not os.path.exists(images_dir):
-                continue
-            imgs = []
-            for f0 in os.listdir(images_dir):
-                if f0.lower().endswith(('.jpg', '.png', '.jpeg')):
-                    imgs.append(os.path.join(images_dir, f0))
-            if len(imgs) == 0:
-                continue
-            if cls not in class_to_paths:
-                class_to_paths[cls] = imgs
+
+        img_files = sorted([f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        mask_files = sorted([f for f in os.listdir(mask_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+        # Build dict of mask filenames without extension / _mask
+        mask_dict = {}
+        for m in mask_files:
+            key = os.path.splitext(m)[0].replace('_mask', '')
+            mask_dict[key] = os.path.join(mask_dir, m)
+
+        # Match images
+        for img in img_files:
+            key = os.path.splitext(img)[0]  # remove extension
+            if key in mask_dict:
+                images.append(os.path.join(img_dir, img))
+                masks.append(mask_dict[key])
+                log_message(f"[DEBUG] Matched image & mask: {img} -> {os.path.basename(mask_dict[key])}", 'INFO')
             else:
-                class_to_paths[cls].extend(imgs)
-    class_names = sorted(list(class_to_paths.keys()))
-    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    mapped = {name_to_idx[name]: class_to_paths[name] for name in class_names}
-    return mapped, class_names
+                log_message(f"[WARNING] No matching mask for image: {os.path.join(img_dir, img)}", 'WARNING')
+
+    log_message(f"[DEBUG] Total images collected: {len(images)}", 'INFO')
+    log_message(f"[DEBUG] Total masks collected: {len(masks)}", 'INFO')
+
+    return images, masks
 
 
-# -------------------- Main pipeline (clean prints) --------------------
+# Main pipeline
 
 def main():
     set_seed(CONFIG['seed'])
@@ -713,7 +958,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_message(f"Using device: {device}", 'INFO')
 
-    # STAGE 1: data
+    # -------------------- STAGE 1: Data --------------------
     log_message("STAGE 1: Data preparation", 'INFO')
     image_paths = get_all_image_paths(CONFIG['data_root'])
     n_food = len(image_paths['Food'])
@@ -752,7 +997,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False,
                             num_workers=CONFIG.get('num_workers', 0), pin_memory=(device.type == 'cuda'))
 
-    # STAGE 2: binary model
+    # -------------------- STAGE 2: Binary classification --------------------
     log_message("STAGE 2: Build & train binary Food-vs-Fruit model", 'INFO')
     model = create_complete_model(num_classes=2).to(device)
 
@@ -761,7 +1006,7 @@ def main():
     training_time = time.time() - start_time
     log_message(f"Binary training done in {training_time / 60:.2f} minutes", 'INFO')
 
-    # STAGE 3: evaluation (load best checkpoint if exists)
+    # -------------------- STAGE 3: Evaluation --------------------
     if os.path.exists(CONFIG['model_save_path']):
         try:
             model.load_state_dict(torch.load(CONFIG['model_save_path'], map_location=device))
@@ -770,18 +1015,17 @@ def main():
             log_message(f"Failed to load best binary model: {e}", 'ERROR')
 
     val_metrics = evaluate_on_validation(model, val_loader, device)
-    # concise metrics display
     log_message("Binary model evaluation:", 'INFO')
     log_message(
         f"  Accuracy: {val_metrics['accuracy'] * 100:.2f}% | Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}",
         'INFO')
 
-    # STAGE 4: build class maps
+    # -------------------- STAGE 4: Class maps --------------------
     log_message("Building class maps for Food & Fruit", 'INFO')
     food_map, food_class_names = build_class_to_paths_for_food(CONFIG['data_root'])
     fruit_map, fruit_class_names = build_class_to_paths_for_fruit(CONFIG['data_root'])
 
-    # save class names (pretty) for later use
+    # save class names
     with open(os.path.join(CONFIG['output_dir'], 'food_class_names.json'), 'w', encoding='utf-8') as f:
         json.dump(food_class_names, f, indent=2, ensure_ascii=False)
     with open(os.path.join(CONFIG['output_dir'], 'fruit_class_names.json'), 'w', encoding='utf-8') as f:
@@ -789,13 +1033,13 @@ def main():
 
     log_message(f"Food classes: {len(food_class_names)} | Fruit classes: {len(fruit_class_names)}", 'INFO')
 
-    # STAGE 5: Train fruit classifier (if applicable)
+    # -------------------- STAGE 5: Fruit classifier --------------------
     fruit_model = train_fruit_classifier(fruit_map, fruit_class_names, train_transform, val_transform, device)
 
-    # STAGE 6: Train siamese embedding for Food (if applicable)
+    # -------------------- STAGE 6: Siamese embedding for Food --------------------
     siamese_model, support_mean = train_siamese_embedding_for_food(food_map, train_transform, val_transform, device)
 
-    # STAGE 7: Batch predictions + subclass inference (concise)
+    # -------------------- STAGE 7: Batch predictions --------------------
     log_message("Running batch predictions on validation set (subclass inference)", 'INFO')
     all_val_images = val_files
     integrated_predictions = []
@@ -819,7 +1063,31 @@ def main():
     save_predictions_to_file(integrated_predictions, os.path.join(CONFIG['output_dir'], 'predictions',
                                                                   'validation_predictions_with_subclasses.txt'))
 
-    # final concise summary
+    # -------------------- STAGE 8: Fruit Binary Segmentation --------------------
+    log_message("STAGE 8: Fruit Binary Segmentation (Part D)", 'INFO')
+    seg_images, seg_masks = collect_fruit_segmentation_data(CONFIG['data_root'])
+    log_message(f"Seg images found: {len(seg_images)}", 'INFO')
+    log_message(f"Seg masks found: {len(seg_masks)}", 'INFO')
+    if len(seg_images) > 0:
+        binary_seg_model = train_binary_segmentation(seg_images, seg_masks, device)
+    else:
+        log_message("No fruit segmentation data found — skipping binary segmentation.", 'WARNING')
+
+    # -------------------- STAGE 9: Fruit Multi-Class Segmentation --------------------
+    log_message("STAGE 9: Fruit Multi-Class Segmentation (Part E)", 'INFO')
+    if len(seg_images) > 0:
+        multiclass_seg_model = train_multiclass_segmentation(
+            seg_images,
+            seg_masks,
+            num_classes=len(fruit_class_names) + 1,
+            device=device
+        )
+    else:
+        log_message("No fruit segmentation data found — skipping multi-class segmentation.", 'WARNING')
+
+    log_message("Segmentation run completed.", 'INFO')
+
+    # -------------------- Final summary --------------------
     log_message("Run summary:", 'INFO')
     log_message(f"  Total images -> Food: {n_food}, Fruit: {n_fruit}", 'INFO')
     log_message(
