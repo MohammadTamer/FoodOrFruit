@@ -347,33 +347,42 @@ def predict_single_image(model, image_path, transform, device):
 # FRUIT MODEL – Multi-class Classification
 def build_class_to_paths_for_fruit(data_root: str):
     fruit_root = os.path.join(data_root, 'Fruit')
-    class_to_paths = {}
-    if not os.path.exists(fruit_root):
-        return {}, []
-    for split in os.listdir(fruit_root):
+
+    train_map = {}
+    val_map = {}
+
+    for split, target in [('Train', train_map), ('Validation', val_map)]:
         split_path = os.path.join(fruit_root, split)
         if not os.path.isdir(split_path):
             continue
+
         for cls in os.listdir(split_path):
-            cls_path = os.path.join(split_path, cls)
-            if not os.path.isdir(cls_path):
+            images_dir = os.path.join(split_path, cls, 'Images')
+            if not os.path.isdir(images_dir):
                 continue
-            images_dir = os.path.join(cls_path, 'Images')
-            if not os.path.exists(images_dir):
-                continue
-            imgs = []
-            for f0 in os.listdir(images_dir):
-                if f0.lower().endswith(('.jpg', '.png', '.jpeg')):
-                    imgs.append(os.path.join(images_dir, f0))
+
+            imgs = [
+                os.path.join(images_dir, f)
+                for f in os.listdir(images_dir)
+                if f.lower().endswith(('.jpg', '.png', '.jpeg'))
+            ]
+
             if len(imgs) == 0:
                 continue
-            if cls not in class_to_paths:
-                class_to_paths[cls] = imgs
-            else:
-                class_to_paths[cls].extend(imgs)
-    class_names = sorted(list(class_to_paths.keys()))
+
+            target[cls] = imgs
+
+    class_names = sorted(train_map.keys())
     name_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    mapped = {name_to_idx[name]: class_to_paths[name] for name in class_names}
+
+    mapped = {
+        idx: {
+            'train': train_map.get(name, []),
+            'val': val_map.get(name, [])
+        }
+        for name, idx in name_to_idx.items()
+    }
+
     return mapped, class_names
 
 
@@ -406,16 +415,15 @@ def train_fruit_classifier(fruit_map, fruit_class_names, train_transform, val_tr
     fruit_val_files = []
     fruit_val_labels = []
 
-    for cls_idx, paths in fruit_map.items():
-        paths_copy = list(paths)
-        random.shuffle(paths_copy)
-        split = int(0.8 * len(paths_copy))
-        train_p = paths_copy[:split]
-        val_p = paths_copy[split:]
-        fruit_train_files.extend(train_p)
-        fruit_train_labels.extend([cls_idx] * len(train_p))
-        fruit_val_files.extend(val_p)
-        fruit_val_labels.extend([cls_idx] * len(val_p))
+    for cls_idx, splits in fruit_map.items():
+        train_imgs = splits.get('train', [])
+        val_imgs = splits.get('val', [])
+
+        fruit_train_files.extend(train_imgs)
+        fruit_train_labels.extend([cls_idx] * len(train_imgs))
+
+        fruit_val_files.extend(val_imgs)
+        fruit_val_labels.extend([cls_idx] * len(val_imgs))
 
     if len(fruit_train_files) == 0:
         log_message("Not enough fruit images to train multi-class fruit model.", 'INFO')
@@ -424,51 +432,61 @@ def train_fruit_classifier(fruit_map, fruit_class_names, train_transform, val_tr
     fruit_train_ds = ImageDataset(fruit_train_files, fruit_train_labels, transform=train_transform)
     fruit_val_ds = ImageDataset(fruit_val_files, fruit_val_labels, transform=val_transform)
 
-    fruit_train_loader = DataLoader(fruit_train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
-                                    num_workers=CONFIG.get('num_workers', 0))
-    fruit_val_loader = DataLoader(fruit_val_ds, batch_size=CONFIG['batch_size'], shuffle=False,
-                                  num_workers=CONFIG.get('num_workers', 0))
+    fruit_train_loader = DataLoader(
+        fruit_train_ds,
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        num_workers=CONFIG.get('num_workers', 0)
+    )
+
+    fruit_val_loader = DataLoader(
+        fruit_val_ds,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        num_workers=CONFIG.get('num_workers', 0)
+    )
 
     fruit_model = create_fruit_model(num_classes=len(fruit_class_names)).to(device)
     fruit_optimizer = optim.Adam(fruit_model.parameters(), lr=CONFIG['fruit_lr'])
     criterion = nn.CrossEntropyLoss()
+
     best_val_acc = 0.0
 
     for epoch in range(CONFIG.get('fruit_epochs', 3)):
         fruit_model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        correct, total = 0, 0
+
         for imgs, labels in fruit_train_loader:
-            imgs = imgs.to(device)
-            labels = labels.to(device)
+            imgs, labels = imgs.to(device), labels.to(device)
             fruit_optimizer.zero_grad()
             out = fruit_model(imgs)
             loss = criterion(out, labels)
             loss.backward()
             fruit_optimizer.step()
-            running_loss += loss.item()
+
             _, preds = torch.max(out, 1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+
         train_acc = 100 * correct / total if total > 0 else 0.0
 
         fruit_model.eval()
-        val_correct = 0
-        val_total = 0
+        val_correct, val_total = 0, 0
         with torch.no_grad():
-            for vimgs, vlabels in fruit_val_loader:
-                vimgs = vimgs.to(device)
-                vlabels = vlabels.to(device)
-                out = fruit_model(vimgs)
+            for imgs, labels in fruit_val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                out = fruit_model(imgs)
                 _, preds = torch.max(out, 1)
-                val_correct += (preds == vlabels).sum().item()
-                val_total += vlabels.size(0)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+
         val_acc = 100 * val_correct / val_total if val_total > 0 else 0.0
 
         log_message(
-            f"[Fruit] Epoch {epoch + 1}/{CONFIG.get('fruit_epochs', 3)} | TrainAcc: {train_acc:.2f}% | ValAcc: {val_acc:.2f}%",
-            'INFO')
+            f"[Fruit] Epoch {epoch + 1}/{CONFIG.get('fruit_epochs', 3)} | "
+            f"TrainAcc: {train_acc:.2f}% | ValAcc: {val_acc:.2f}%",
+            'INFO'
+        )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
